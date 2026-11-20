@@ -10,6 +10,16 @@ const portal = require("./portal");
 const one_time = require("./one_time");
 const { upgrade_with_session_id } = require("./common");
 
+const getLegacyInactiveRoleId = (roles) => {
+  const roleIds = new Set(roles.map((role) => Number(role.id)));
+
+  if (roleIds.has(8)) return 8;
+  if (roleIds.has(80)) return 80;
+
+  return null;
+};
+
+
 const configuration_workflow = () => {
   const cfg_base_url = getState().getConfig("base_url");
 
@@ -17,11 +27,29 @@ const configuration_workflow = () => {
     steps: [
       {
         name: "Stripe configuration",
-        form: () =>
-          new Form({
+        form: async () => {
+          const roles = await User.get_roles();
+          const legacyRoleId = getLegacyInactiveRoleId(roles);
+          const roleOptions = roles
+            .filter((role) => Number(role.id) !== legacyRoleId)
+            .map((role) => ({
+              value: role.id,
+              label: `${role.role} (role ${role.id})`,
+            }));
+
+
+          const legacyOption = legacyRoleId
+            ? {
+              value: legacyRoleId,
+              label: `Legacy default: role ${legacyRoleId}`,
+            }
+            : null;
+
+
+          return new Form({
             labelCols: 3,
             blurb: !cfg_base_url
-              ? "You should set the 'Base URL' configration property. "
+              ? "You should set the 'Base URL' configuration property. "
               : "",
             fields: [
               {
@@ -39,12 +67,26 @@ const configuration_workflow = () => {
               {
                 name: "webhook_signing_secret",
                 label: "Webhook signing secret",
-                sublabel: `Enable a 'stripe_webhook' as an 'API call' action.`,
+                sublabel:
+                  "Enable a 'stripe_webhook' as an 'API call' action.",
                 type: "String",
                 required: true,
               },
+              {
+                name: "inactive_role_id",
+                label: "Inactive subscription role",
+                input_type: "select",
+                required: true,
+                options: [
+                  ...(legacyOption ? [legacyOption] : []),
+                  ...roleOptions,
+                ],
+                sublabel:
+                  "Used after cancellation or payment failure. Existing installations without a saved value will retain the legacy role 8 behavior.",
+              },
             ],
-          }),
+          });
+        },
       },
     ],
   });
@@ -71,19 +113,22 @@ const sessionCompleted = async (event) => {
     });
   }
 };
-const cancelSubscription = async (event) => {
+const cancelSubscription = async (event, inactive_role_id) => {
   const customer = event.data.object.customer;
   const user = await User.findOne({
     _attributes: { json: ["stripe_customer", customer] },
   });
 
   if (user) {
-    await user.update({ role_id: 8 });
+    const configuredRoleId = Number(inactive_role_id);
+    const roleId = configuredRoleId || 8;
+
+    await user.update({ role_id: roleId });
   }
 };
 
 // user subscribe action
-const actions = ({ api_key, webhook_signing_secret }) => {
+const actions = ({ api_key, webhook_signing_secret, inactive_role_id }) => {
   const stripe = Stripe(api_key);
   return {
     stripe_webhook: {
@@ -105,7 +150,7 @@ const actions = ({ api_key, webhook_signing_secret }) => {
             break;
           case "customer.subscription.deleted":
           case "invoice.payment_failed":
-            await cancelSubscription(event, stripe);
+            await cancelSubscription(event, inactive_role_id);
             break;
 
           default:
