@@ -2,6 +2,7 @@ const Workflow = require("@saltcorn/data/models/workflow");
 const Form = require("@saltcorn/data/models/form");
 const Page = require("@saltcorn/data/models/page");
 const Table = require("@saltcorn/data/models/table");
+const Trigger = require("@saltcorn/data/models/trigger");
 
 const User = require("@saltcorn/data/models/user");
 const { getState } = require("@saltcorn/data/db/state");
@@ -22,11 +23,10 @@ const one_time_configuration_workflow = (config, stripe) => () => {
             .filter((p) => !p.recurring)
             .map((p) => ({
               value: p.id,
-              label: `${
-                p.nickname ? `${p.nickname}: ` : ""
-              }${p.currency.toUpperCase()} ${Math.floor(
-                p.unit_amount / 100
-              )}.${String(p.unit_amount % 100).padStart(2, "0")}`,
+              label: `${p.nickname ? `${p.nickname}: ` : ""
+                }${p.currency.toUpperCase()} ${Math.floor(
+                  p.unit_amount / 100
+                )}.${String(p.unit_amount % 100).padStart(2, "0")} [${p.id}]`,
             }));
           const pages = await Page.find();
           const page_opts = pages.map((p) => ({
@@ -36,6 +36,21 @@ const one_time_configuration_workflow = (config, stripe) => () => {
           const jsonFields = Table.findOne("users").fields.filter(
             (f) => f.type.name === "JSON"
           );
+          const successTriggers = (await Trigger.findDB({
+            when_trigger: "Never",
+          }))
+            .filter((trigger) => trigger.action !== "Workflow")
+            .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+          const successTriggerOptions = [
+            {
+              value: "",
+              label: "— Select a Trigger —",
+            },
+            ...successTriggers.map((trigger) => ({
+              value: trigger.name,
+              label: `${trigger.name} (${trigger.action})`,
+            })),
+          ];
           return new Form({
             labelCols: 3,
             blurb: [
@@ -96,6 +111,26 @@ const one_time_configuration_workflow = (config, stripe) => () => {
                 label: "Button label",
                 type: "String",
               },
+              {
+                name: "run_success_trigger",
+                label: "Run Trigger after successful purchase",
+                type: "Bool",
+                default: false,
+                sublabel:
+                  "When enabled, execute the selected server-side Trigger after Stripe confirms the purchase.",
+              },
+              {
+                name: "success_trigger",
+                label: "Success Trigger",
+                input_type: "select",
+                showIf: {
+                  run_success_trigger: true,
+                },
+                required: true,
+                options: successTriggerOptions,
+                sublabel:
+                  "Select a manually callable server-side Trigger. Workflows are not available at this time.",
+              },
             ],
           });
         },
@@ -106,12 +141,11 @@ const one_time_configuration_workflow = (config, stripe) => () => {
 
 const run_one_time =
   (plug_config, stripe) =>
-  async (table_id, viewname, config, state, extraArgs) => {
-    const priceId = config.price_id;
-    return `<script src="https://js.stripe.com/v3/"></script>
-    <button class="btn btn-primary" id="${viewname}_checkout">${
-      config.link_label || "Pay"
-    }</button>
+    async (table_id, viewname, config, state, extraArgs) => {
+      const priceId = config.price_id;
+      return `<script src="https://js.stripe.com/v3/"></script>
+    <button class="btn btn-primary" id="${viewname}_checkout">${config.link_label || "Pay"
+        }</button>
     <script>
     var createCheckoutSession = function(priceId) {
       return fetch("/view/${viewname}/create_checkout_session", {
@@ -141,61 +175,92 @@ const run_one_time =
         });
       });
     </script>`;
-  };
+    };
 
 const create_one_time_checkout_session =
   (plug_config, stripe) =>
-  async (table_id, viewname, config, body, { req }) => {
-    const { priceId } = req.body;
-    const base_url = getState().getConfig("base_url");
-    const user_id = req.user && req.user.id;
-    try {
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        line_items: [
-          {
-            price: priceId,
-            quantity: 1,
-          },
-        ],
-        success_url:
-          trailSlash(base_url) +
-          "page/" +
-          config.success_page +
-          "?stripe_session_id={CHECKOUT_SESSION_ID}",
-        cancel_url: trailSlash(base_url) + "page/" + config.cancel_page,
-      });
+    async (table_id, viewname, config, body, { req }) => {
+      const { priceId } = req.body;
+      const price = await stripe.prices.retrieve(priceId);
+      const productId =
+        typeof price.product === "string"
+          ? price.product
+          : price.product?.id;
 
-      if (user_id) {
-        const user = await User.findOne({ id: user_id });
-        await user.update({
-          _attributes: {
-            ...user._attributes,
-            stripe_sessions: {
-              ...(user._attributes.stripe_sessions || {}),
-              [session.id]: {
-                onsuccess: {
-                  ...(config.role_id
-                    ? { elevate_user_role: +config.role_id }
-                    : {}),
-                  response_field: config.response_field,
+      const base_url = getState().getConfig("base_url");
+      const user_id = req.user && req.user.id;
+      try {
+        const sessionMetadata = {
+          saltcorn_view: viewname,
+          saltcorn_price_id: priceId,
+
+          ...(productId
+            ? {
+              saltcorn_product_id: productId,
+            }
+            : {}),
+
+          ...(user_id
+            ? {
+              saltcorn_user_id: String(user_id),
+            }
+            : {}),
+
+          ...(config.run_success_trigger && config.success_trigger
+            ? {
+              saltcorn_success_trigger: config.success_trigger,
+            }
+            : {}),
+        };
+
+
+        const session = await stripe.checkout.sessions.create({
+          mode: "payment",
+          line_items: [
+            {
+              price: priceId,
+              quantity: 1,
+            },
+          ],
+          metadata: sessionMetadata,
+          success_url:
+            trailSlash(base_url) +
+            "page/" +
+            config.success_page +
+            "?stripe_session_id={CHECKOUT_SESSION_ID}",
+          cancel_url: trailSlash(base_url) + "page/" + config.cancel_page,
+        });
+
+        if (user_id) {
+          const user = await User.findOne({ id: user_id });
+          await user.update({
+            _attributes: {
+              ...user._attributes,
+              stripe_sessions: {
+                ...(user._attributes.stripe_sessions || {}),
+                [session.id]: {
+                  onsuccess: {
+                    ...(config.role_id
+                      ? { elevate_user_role: +config.role_id }
+                      : {}),
+                    response_field: config.response_field,
+                  },
+                  created: new Date(),
                 },
-                created: new Date(),
               },
             },
-          },
-        });
-      }
+          });
+        }
 
-      return { json: { sessionId: session.id } };
-    } catch (e) {
-      db.sql_log(e);
-      return {
-        status: 400,
-        json: { error: { message: e.message } },
-      };
-    }
-  };
+        return { json: { sessionId: session.id } };
+      } catch (e) {
+        db.sql_log(e);
+        return {
+          status: 400,
+          json: { error: { message: e.message } },
+        };
+      }
+    };
 
 const one_time = (config, stripe) => {
   return {
